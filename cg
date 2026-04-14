@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+#
+# cg — Context Guard wrapper for Claude Code
+#
+# 用法:  cg [claude 的任何参数]
+#
+#   cg                                          # 交互式
+#   cg "帮我重构 auth 模块"                       # 带初始 prompt
+#   cg --dangerously-skip-permissions            # 任何 claude flag
+#   cg --model opus --effort high "开始工作"      # flag + prompt 混用
+#
+# 所有 claude 参数都会被透传。flag 在重启时保留，只有初始 prompt 会被替换。
+#
+
+set -uo pipefail
+
+STATE_DIR="${CONTEXT_GUARD_STATE_DIR:-$HOME/.claude/context-guard}"
+NEXT_PROMPT_MARKER="$STATE_DIR/next_prompt"
+ARCHIVE_DIR="$STATE_DIR/archive"
+
+mkdir -p "$STATE_DIR" "$ARCHIVE_DIR"
+
+# 颜色
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ═══════════════════════════════════════════════════
+#  全局清理：确保 Ctrl+C 等信号能干净退出
+# ═══════════════════════════════════════════════════
+
+MONITOR_PID=""
+CLAUDE_PID=""
+
+cleanup() {
+    # 杀掉后台监控进程
+    if [ -n "$MONITOR_PID" ]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+    # 清理状态文件
+    rm -f "$STATE_DIR/summarizing"
+}
+
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# ═══════════════════════════════════════════════════
+#  前置检查
+# ═══════════════════════════════════════════════════
+
+if ! command -v claude &>/dev/null; then
+    echo -e "${RED}❌ 找不到 claude 命令${NC}" >&2
+    echo "   请先安装 Claude Code: npm install -g @anthropic-ai/claude-code" >&2
+    exit 1
+fi
+
+# ═══════════════════════════════════════════════════
+#  解析参数：分离 flags 和 prompt
+# ═══════════════════════════════════════════════════
+
+# claude CLI 中需要跟一个值的 flag（来自官方文档）
+# https://code.claude.com/docs/en/cli-reference
+#
+# 对于可选值的 flag (如 --debug)，请使用 = 语法：
+#   cg --debug="api,hooks" "my prompt"
+#
+FLAGS_WITH_VALUE=(
+    --add-dir
+    --agent
+    --agents
+    --allowedTools
+    --append-system-prompt
+    --append-system-prompt-file
+    --betas
+    --channels
+    --dangerously-load-development-channels
+    --debug-file
+    --disallowedTools
+    --effort
+    --max-turns
+    --model -m
+    --output-format
+    --permission-mode
+    --permission-prompt-tool
+    --resume -r
+    --system-prompt
+    --system-prompt-file
+    --tools
+)
+
+is_flag_with_value() {
+    local flag="$1"
+    for f in "${FLAGS_WITH_VALUE[@]}"; do
+        [ "$flag" = "$f" ] && return 0
+    done
+    return 1
+}
+
+PERSISTENT_FLAGS=()
+INITIAL_PROMPT=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --)
+            shift
+            [[ $# -gt 0 ]] && INITIAL_PROMPT="$1"
+            break
+            ;;
+        --*=*)
+            PERSISTENT_FLAGS+=("$1")
+            ;;
+        -*)
+            if is_flag_with_value "$1"; then
+                PERSISTENT_FLAGS+=("$1")
+                if [[ $# -gt 1 ]]; then
+                    PERSISTENT_FLAGS+=("$2")
+                    shift
+                fi
+            else
+                PERSISTENT_FLAGS+=("$1")
+            fi
+            ;;
+        *)
+            INITIAL_PROMPT="$1"
+            ;;
+    esac
+    shift
+done
+
+# ═══════════════════════════════════════════════════
+#  辅助函数
+# ═══════════════════════════════════════════════════
+
+cleanup_markers() {
+    rm -f "$NEXT_PROMPT_MARKER"
+    rm -f "$STATE_DIR/summarizing"
+}
+
+# 后台监控：检测 next_prompt 标记 → 发送 SIGINT 终止 claude
+start_monitor() {
+    local TARGET_PID="$1"
+    (
+        while true; do
+            sleep 2
+            # 如果 claude 已经退出了，监控也退出
+            if ! kill -0 "$TARGET_PID" 2>/dev/null; then
+                exit 0
+            fi
+            # 检查标记文件
+            if [ -f "$NEXT_PROMPT_MARKER" ]; then
+                local PPATH
+                PPATH=$(cat "$NEXT_PROMPT_MARKER" 2>/dev/null || true)
+                if [ -n "$PPATH" ] && [ -f "$PPATH" ]; then
+                    sleep 3  # 给 Claude 完成输出的时间
+                    kill -INT "$TARGET_PID" 2>/dev/null || true
+                    exit 0
+                fi
+            fi
+        done
+    ) &
+    MONITOR_PID=$!
+}
+
+archive_prompt() {
+    local PROMPT_PATH="$1"
+    [ -f "$PROMPT_PATH" ] && cp "$PROMPT_PATH" "$ARCHIVE_DIR/$(basename "$PROMPT_PATH")"
+}
+
+# ═══════════════════════════════════════════════════
+#  主循环
+# ═══════════════════════════════════════════════════
+
+ITERATION=0
+CURRENT_PROMPT="$INITIAL_PROMPT"
+
+cleanup_markers
+
+while true; do
+    ITERATION=$((ITERATION + 1))
+
+    if [ "$ITERATION" -eq 1 ]; then
+        echo -e "${CYAN}🛡️  Context Guard 已启用${NC} ${DIM}(阈值: ${CONTEXT_GUARD_THRESHOLD:-128000} tokens)${NC}"
+        if [ ${#PERSISTENT_FLAGS[@]} -gt 0 ]; then
+            echo -e "${DIM}   flags: ${PERSISTENT_FLAGS[*]}${NC}"
+        fi
+        echo ""
+    else
+        echo ""
+        echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}  🔄 Context Guard: 自动重启会话 #${ITERATION}${NC}"
+        echo -e "${GREEN}═══════════════════════════════════════════════════════${NC}"
+        echo ""
+    fi
+
+    # 构建参数
+    CLAUDE_ARGS=()
+    if [ ${#PERSISTENT_FLAGS[@]} -gt 0 ]; then
+        CLAUDE_ARGS+=("${PERSISTENT_FLAGS[@]}")
+    fi
+    if [ -n "$CURRENT_PROMPT" ]; then
+        CLAUDE_ARGS+=("$CURRENT_PROMPT")
+    fi
+
+    # 启动 claude（后台，以便获取 PID 和启动监控）
+    if [ ${#CLAUDE_ARGS[@]} -gt 0 ]; then
+        claude "${CLAUDE_ARGS[@]}" &
+    else
+        claude &
+    fi
+    CLAUDE_PID=$!
+
+    # 快速失败检测：如果 claude 在 1 秒内就退出了，说明启动失败
+    sleep 1
+    if ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
+        set +e
+        wait "$CLAUDE_PID" 2>/dev/null
+        CLAUDE_EXIT=$?
+        set -e
+        echo ""
+        echo -e "${RED}❌ claude 启动失败 (exit code: $CLAUDE_EXIT)${NC}"
+        echo -e "${DIM}   请检查参数是否正确${NC}"
+        if [ ${#CLAUDE_ARGS[@]} -gt 0 ]; then
+            echo -e "${DIM}   当前参数: ${CLAUDE_ARGS[*]}${NC}"
+        fi
+        cleanup
+        exit "$CLAUDE_EXIT"
+    fi
+
+    # 启动后台监控
+    start_monitor "$CLAUDE_PID"
+
+    # 等待 claude 退出（转发 SIGINT 给 claude）
+    set +e
+    wait "$CLAUDE_PID" 2>/dev/null
+    CLAUDE_EXIT=$?
+    set -e
+
+    # 停止监控
+    if [ -n "$MONITOR_PID" ]; then
+        kill "$MONITOR_PID" 2>/dev/null || true
+        wait "$MONITOR_PID" 2>/dev/null || true
+        MONITOR_PID=""
+    fi
+
+    # 检查是否需要重启
+    if [ -f "$NEXT_PROMPT_MARKER" ]; then
+        PROMPT_PATH=$(cat "$NEXT_PROMPT_MARKER" 2>/dev/null || true)
+
+        if [ -n "$PROMPT_PATH" ] && [ -f "$PROMPT_PATH" ]; then
+            echo ""
+            echo -e "${YELLOW}📋 已加载 continuation prompt: $(basename "$PROMPT_PATH")${NC}"
+
+            CURRENT_PROMPT=$(cat "$PROMPT_PATH")
+
+            archive_prompt "$PROMPT_PATH"
+            cleanup_markers
+
+            continue
+        fi
+    fi
+
+    # 正常退出
+    cleanup
+    echo ""
+    echo -e "${DIM}Claude Code 已退出 (code: $CLAUDE_EXIT)${NC}"
+    break
+done

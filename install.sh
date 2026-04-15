@@ -32,10 +32,11 @@ import json
 with open('$SETTINGS_FILE', 'r') as f:
     s = json.load(f)
 h = s.get('hooks', {})
-for ev in ['PreToolUse', 'SessionStart', 'Stop']:
+for ev in ['PreToolUse', 'SessionStart', 'Stop', 'PermissionRequest']:
     if ev in h:
         h[ev] = [r for r in h[ev]
                  if not any('context_guard' in x.get('command','') or 'stop_hook' in x.get('command','')
+                            or 'auto_approve_guard' in x.get('command','')
                             for x in r.get('hooks', []))]
         if not h[ev]: del h[ev]
 if not h and 'hooks' in s: del s['hooks']
@@ -107,6 +108,9 @@ upsert_hook("PreToolUse", "context_guard_hook",
 
 upsert_hook("Stop", "stop_hook",
             f"CONTEXT_GUARD_THRESHOLD={th} bash {sd}/stop_hook.sh")
+
+upsert_hook("PermissionRequest", "auto_approve_guard",
+            f"CONTEXT_GUARD_THRESHOLD={th} python3 {sd}/auto_approve_guard.py")
 
 upsert_hook("SessionStart", "session_start_hook",
             f"bash {sd}/session_start_hook.sh")

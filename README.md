@@ -81,6 +81,7 @@ context-guard/
 ├── context_guard_hook.sh     # PreToolUse hook（工具调用前检测超限 → 触发总结）
 ├── stop_hook.sh              # Stop hook（检查纯文本回复后超限 + 兜底写 next_prompt）
 ├── session_start_hook.sh     # SessionStart hook（清理旧状态）
+├── auto_approve_guard.py     # PermissionRequest hook（只自动放行 guard 目录写入）
 ├── check_context.py          # 上下文用量计算（可独立使用）
 ├── install.sh                # 安装/卸载
 └── README.md
@@ -121,6 +122,14 @@ Claude Code 的 hooks 无法直接：
 `next_prompt` 不需要 Claude 自己执行 Bash 命令写入。Hook 会把本次期望的
 continuation 文件名提前写进 `summarizing`，Stop hook 只检查这个指定文件，
 不会通过“最近修改的 continuation 文件”猜测目标。
+
+安装后还会注册一个 `PermissionRequest` hook。它只自动批准 Context Guard 自己的
+交接写入：
+
+- `Write` / `Edit` / `MultiEdit` 写入 `~/.claude/context-guard/` 下的文件
+- 兼容旧流程的 `echo ... > ~/.claude/context-guard/next_prompt`
+
+其他任何写文件或 Bash 操作都不会被这个 hook 放行，仍然走 Claude Code 正常权限确认。
 
 ### Session ID 追溯
 
@@ -163,10 +172,11 @@ claude --dangerously-skip-permissions --model opus "continuation prompt 内容..
 ### 权限建议
 
 Context Guard 已经避免让 Claude 执行 `echo ... > next_prompt` 这类额外 Bash
-命令；重启标记由 Stop hook 自动写入。但 continuation prompt 的内容必须由模型
-总结出来，因此仍然需要 Claude Code 写入这个 markdown 文件。
+命令；重启标记由 Stop hook 自动写入。对于 continuation prompt 的写入，安装脚本
+会注册 `auto_approve_guard.py` 作为 `PermissionRequest` hook，只自动放行写入
+`~/.claude/context-guard/` 目录的操作。
 
-如果你不希望总结交接时弹出写文件权限确认，可以用更宽松的权限模式启动：
+这比全局跳过权限更窄。你仍然可以在可信环境里用更宽松的权限模式启动：
 
 ```bash
 cg --dangerously-skip-permissions
